@@ -1,13 +1,16 @@
 /**
- * Sleep Call P2P — Signaling Server
+ * Sleep Call P2P — Signaling Server (Tahap 3)
  *
  * Cloudflare Worker + Durable Object untuk signaling WebRTC.
  * Mengikuti docs/PROTOCOL.md secara ketat.
  *
- * - Satu room permanen "private-sleep-room", maks 2 peserta
- * - Autentikasi via header Authorization: Bearer <token>
- * - WebSocket Hibernation API agar hemat resource
- * - ping/pong via setWebSocketAutoResponse
+ * Fitur Tahap 3:
+ * - Kredensial TURN sementara (HMAC-SHA1, minimal 12 jam)
+ * - Rate limiting auth (5 kegagalan per IP per menit -> blokir 30 detik)
+ * - Keamanan log ketat (tidak ada SDP, ICE, atau token di log)
+ * - Validasi pesan ketat (bad-message) tanpa memutuskan peer lain
+ * - Pertahankan role polite / impolite dan device replace
+ * - Auto ping/pong via setWebSocketAutoResponse
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -15,6 +18,8 @@
 interface Env {
   ROOM: DurableObjectNamespace;
   ROOM_TOKEN: string;
+  TURN_SECRET?: string;
+  TURN_URL?: string;
 }
 
 /** Data yang disimpan di WebSocket attachment */
@@ -27,6 +32,102 @@ interface WSAttachment {
 
 type ErrorCode = "bad-token" | "room-full" | "replaced" | "bad-message";
 
+interface IceServerConfig {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+// ─── Rate Limiting (In-Memory per Worker Instance) ──────────────────────────
+
+interface RateLimitEntry {
+  failures: number;
+  firstFailureAt: number;
+  blockedUntil: number;
+}
+
+const rateLimitMap = new Map<string, RateLimitEntry>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry) return false;
+  if (entry.blockedUntil > now) {
+    return true;
+  }
+  // Reset if block expired
+  if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
+    rateLimitMap.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function recordFailedAuth(ip: string): void {
+  const now = Date.now();
+  let entry = rateLimitMap.get(ip);
+  if (!entry || now - entry.firstFailureAt > 60000) {
+    entry = { failures: 1, firstFailureAt: now, blockedUntil: 0 };
+  } else {
+    entry.failures += 1;
+    if (entry.failures >= 5) {
+      entry.blockedUntil = now + 30000; // Blokir 30 detik
+      console.warn(`[rate-limit] IP ${ip} blocked for 30s after 5 failed auth attempts`);
+    }
+  }
+  rateLimitMap.set(ip, entry);
+}
+
+function recordSuccessfulAuth(ip: string): void {
+  rateLimitMap.delete(ip);
+}
+
+// ─── TURN Credentials Generator (HMAC-SHA1) ─────────────────────────────────
+
+async function generateHmacSha1Base64(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  const bytes = new Uint8Array(signature);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+async function buildIceServers(env: Env, deviceId: string): Promise<IceServerConfig[]> {
+  const iceServers: IceServerConfig[] = [];
+
+  // Jika TURN_SECRET dan TURN_URL dikonfigurasi, buat ephemeral credentials
+  if (env.TURN_SECRET && env.TURN_URL) {
+    const ttlSeconds = 24 * 3600; // 24 jam (memenuhi syarat minimal 12 jam)
+    const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
+    const username = `${expiry}:${deviceId}`;
+    const credential = await generateHmacSha1Base64(env.TURN_SECRET, username);
+    const urls = env.TURN_URL.split(",").map((u) => u.trim()).filter(Boolean);
+
+    iceServers.push({
+      urls,
+      username,
+      credential,
+    });
+  }
+
+  // Selalu sertakan STUN Google sebagai fallback / kandidat langsung
+  iceServers.push({
+    urls: ["stun:stun.l.google.com:19302"],
+  });
+
+  return iceServers;
+}
+
 // ─── Room Durable Object ────────────────────────────────────────────────────
 
 export class Room implements DurableObject {
@@ -37,7 +138,7 @@ export class Room implements DurableObject {
     this.state = state;
     this.env = env;
 
-    // Auto-respond to ping with pong — doesn't wake the Durable Object
+    // Auto-respond to ping with pong — hemat baterai & resource DO
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair(
         JSON.stringify({ type: "ping" }),
@@ -97,7 +198,7 @@ export class Room implements DurableObject {
 
     switch (msg.type) {
       case "join":
-        this.handleJoin(ws, msg as Record<string, unknown>);
+        await this.handleJoin(ws, msg as Record<string, unknown>);
         break;
       case "signal":
         this.handleSignal(ws, msg as Record<string, unknown>);
@@ -109,7 +210,6 @@ export class Room implements DurableObject {
         this.handleLeave(ws);
         break;
       case "ping":
-        // Handled by setWebSocketAutoResponse, but if it reaches here, reply manually
         this.send(ws, { type: "pong" });
         break;
       default:
@@ -127,13 +227,13 @@ export class Room implements DurableObject {
 
   // ─── Message Handlers ──────────────────────────────────────────────────
 
-  private handleJoin(ws: WebSocket, msg: Record<string, unknown>): void {
+  private async handleJoin(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
     // Validate required fields
     const deviceId = msg.deviceId;
     const platform = msg.platform;
     const appVersion = msg.appVersion;
 
-    if (!deviceId || typeof deviceId !== "string") {
+    if (!deviceId || typeof deviceId !== "string" || deviceId.trim().length === 0) {
       this.sendError(ws, "bad-message");
       return;
     }
@@ -162,10 +262,10 @@ export class Room implements DurableObject {
       }
     }
 
-    // Count current joined peers (those with attachments, excluding the one we just closed)
+    // Count current joined peers (those with attachments, excluding replaced ones)
     const joinedPeers = this.getJoinedPeers(ws);
 
-    // Check room capacity
+    // Check room capacity (max 2)
     if (joinedPeers.length >= 2) {
       this.send(ws, { type: "error", code: "room-full" });
       ws.close(1000, "room-full");
@@ -184,13 +284,16 @@ export class Room implements DurableObject {
     };
     ws.serializeAttachment(attachment);
 
+    // Dapatkan kredensial ICE (TURN + STUN)
+    const iceServers = await buildIceServers(this.env, deviceId as string);
+
     // Send joined to this client
     const peerDeviceIds = joinedPeers.map((p) => p.attachment.deviceId);
     this.send(ws, {
       type: "joined",
       role,
       peers: peerDeviceIds,
-      iceServers: [], // Empty for now — Tahap 3 adds TURN credentials
+      iceServers,
     });
 
     // Notify all existing peers about new peer, and notify new peer about existing peers
@@ -210,17 +313,17 @@ export class Room implements DurableObject {
       });
     }
 
+    // Aman untuk log: hanya deviceId dan role, tidak ada token/kredensial
     console.log(`[join] deviceId=${deviceId} role=${role} peers=${peerDeviceIds.length}`);
   }
 
   private handleSignal(ws: WebSocket, msg: Record<string, unknown>): void {
-    // Validate
     const kind = msg.kind;
     if (!kind || typeof kind !== "string" || !["offer", "answer", "candidate"].includes(kind)) {
       this.sendError(ws, "bad-message");
       return;
     }
-    if (msg.data === undefined || msg.data === null) {
+    if (msg.data === undefined || msg.data === null || typeof msg.data !== "object") {
       this.sendError(ws, "bad-message");
       return;
     }
@@ -231,13 +334,14 @@ export class Room implements DurableObject {
       return;
     }
 
-    // Forward to peer (do NOT log contents for security)
+    // Forward to peer (TIDAK PERNAH mencatat payload SDP/ICE ke log demi privasi)
     const peer = this.getPeer(ws);
     if (peer) {
       this.send(peer.ws, {
         type: "signal",
         kind: kind as string,
         data: msg.data,
+        deviceId: (msg.deviceId as string) || attachment.deviceId,
       });
     }
   }
@@ -258,6 +362,7 @@ export class Room implements DurableObject {
         camera: msg.camera,
         screen: msg.screen,
         mode: msg.mode,
+        deviceId: (msg.deviceId as string) || attachment.deviceId,
       });
     }
   }
@@ -289,29 +394,31 @@ export class Room implements DurableObject {
 
   // ─── Helpers ────────────────────────────────────────────────────────────
 
-  /** Get all joined peers (WebSockets with attachments) excluding the given socket */
-  private getJoinedPeers(excludeWs: WebSocket): Array<{ ws: WebSocket; attachment: WSAttachment }> {
+  /** Get all joined peers (sockets with attachments), optionally excluding one */
+  private getJoinedPeers(excludeWs?: WebSocket): Array<{ ws: WebSocket; attachment: WSAttachment }> {
     const sockets = this.state.getWebSockets();
-    const peers: Array<{ ws: WebSocket; attachment: WSAttachment }> = [];
+    const result: Array<{ ws: WebSocket; attachment: WSAttachment }> = [];
 
-    for (const s of sockets) {
-      if (s === excludeWs) continue;
-      const attachment = s.deserializeAttachment() as WSAttachment | null;
+    for (const socket of sockets) {
+      if (excludeWs && socket === excludeWs) continue;
+      const attachment = socket.deserializeAttachment() as WSAttachment | null;
       if (attachment) {
-        peers.push({ ws: s, attachment });
+        result.push({ ws: socket, attachment });
       }
     }
 
-    return peers;
+    return result;
   }
 
   /** Get the single peer of a given WebSocket, also excluding another socket */
   private getPeerExcluding(ws: WebSocket, alsoExclude: WebSocket): { ws: WebSocket; attachment: WSAttachment } | null {
     const sockets = this.state.getWebSockets();
-    for (const s of sockets) {
-      if (s === ws || s === alsoExclude) continue;
-      const attachment = s.deserializeAttachment() as WSAttachment | null;
-      if (attachment) return { ws: s, attachment };
+    for (const socket of sockets) {
+      if (socket === ws || socket === alsoExclude) continue;
+      const attachment = socket.deserializeAttachment() as WSAttachment | null;
+      if (attachment) {
+        return { ws: socket, attachment };
+      }
     }
     return null;
   }
@@ -322,10 +429,10 @@ export class Room implements DurableObject {
     return peers.length > 0 ? peers[0] : null;
   }
 
-  /** Send a message to a WebSocket */
-  private send(ws: WebSocket, msg: Record<string, unknown>): void {
+  /** Send a JSON message to a WebSocket */
+  private send(ws: WebSocket, data: Record<string, unknown>): void {
     try {
-      ws.send(JSON.stringify(msg));
+      ws.send(JSON.stringify(data));
     } catch {
       // Socket might be closed already
     }
@@ -348,6 +455,19 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
+    const clientIp =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("x-forwarded-for") ||
+      "127.0.0.1";
+
+    // Rate limit check
+    if (isRateLimited(clientIp)) {
+      return new Response("Too Many Requests", {
+        status: 429,
+        headers: { "Retry-After": "30" },
+      });
+    }
+
     // Check WebSocket upgrade
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
@@ -357,13 +477,18 @@ export default {
     // Authenticate
     const authHeader = request.headers.get("Authorization");
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      recordFailedAuth(clientIp);
       return new Response("Unauthorized", { status: 401 });
     }
 
     const token = authHeader.slice("Bearer ".length).trim();
     if (!env.ROOM_TOKEN || token !== env.ROOM_TOKEN) {
+      recordFailedAuth(clientIp);
       return new Response("Unauthorized", { status: 401 });
     }
+
+    // Berhasil autentikasi
+    recordSuccessfulAuth(clientIp);
 
     // Route to Durable Object — single room with fixed name
     const roomId = env.ROOM.idFromName("private-sleep-room");

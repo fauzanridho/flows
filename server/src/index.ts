@@ -148,9 +148,26 @@ export class Room implements DurableObject {
   }
 
   /**
-   * Handle incoming HTTP request (WebSocket upgrade).
+   * Handle incoming HTTP request (WebSocket upgrade or room reset).
    */
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/reset") {
+      const sockets = this.state.getWebSockets();
+      const devices = sockets.map((s) => s.deserializeAttachment());
+      let closed = 0;
+      for (const s of sockets) {
+        try {
+          s.serializeAttachment(null);
+          s.close(1000, "room-reset");
+          closed++;
+        } catch {}
+      }
+      return new Response(JSON.stringify({ ok: true, closedSockets: closed, devices }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
@@ -287,12 +304,15 @@ export class Room implements DurableObject {
     // Dapatkan kredensial ICE (TURN + STUN)
     const iceServers = await buildIceServers(this.env, deviceId as string);
 
-    // Send joined to this client
-    const peerDeviceIds = joinedPeers.map((p) => p.attachment.deviceId);
+    // Send joined to this client (send PeerInfo objects { deviceId, platform } for Android & Web compatibility)
+    const peerList = joinedPeers.map((p) => ({
+      deviceId: p.attachment.deviceId,
+      platform: p.attachment.platform || "unknown",
+    }));
     this.send(ws, {
       type: "joined",
       role,
-      peers: peerDeviceIds,
+      peers: peerList,
       iceServers,
     });
 
@@ -314,7 +334,7 @@ export class Room implements DurableObject {
     }
 
     // Aman untuk log: hanya deviceId dan role, tidak ada token/kredensial
-    console.log(`[join] deviceId=${deviceId} role=${role} peers=${peerDeviceIds.length}`);
+    console.log(`[join] deviceId=${deviceId} role=${role} peers=${peerList.length}`);
   }
 
   private handleSignal(ws: WebSocket, msg: Record<string, unknown>): void {
@@ -380,8 +400,14 @@ export class Room implements DurableObject {
     const attachment = ws.deserializeAttachment() as WSAttachment | null;
     if (!attachment) return;
 
-    // Notify peer
+    // Notify peer before clearing attachment
     const peer = this.getPeer(ws);
+
+    // Clear attachment so this socket is not counted in getJoinedPeers
+    try {
+      ws.serializeAttachment(null);
+    } catch {}
+
     if (peer) {
       this.send(peer.ws, {
         type: "peer-left",
@@ -401,6 +427,11 @@ export class Room implements DurableObject {
 
     for (const socket of sockets) {
       if (excludeWs && socket === excludeWs) continue;
+      // In Cloudflare Workers, check readyState if available (readyState 1 is OPEN)
+      if ("readyState" in socket && socket.readyState !== 1 && socket.readyState !== undefined) {
+        try { socket.serializeAttachment(null); } catch {}
+        continue;
+      }
       const attachment = socket.deserializeAttachment() as WSAttachment | null;
       if (attachment) {
         result.push({ ws: socket, attachment });
@@ -450,8 +481,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Only handle /ws
-    if (url.pathname !== "/ws") {
+    // Handle /ws and /reset
+    if (url.pathname !== "/ws" && url.pathname !== "/reset") {
       return new Response("Not found", { status: 404 });
     }
 
@@ -468,27 +499,35 @@ export default {
       });
     }
 
-    // Check WebSocket upgrade
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
-      return new Response("Expected WebSocket upgrade", { status: 426 });
-    }
-
-    // Authenticate
+    // Authenticate (Header Bearer or query param for browser WebSockets)
+    let token: string | null = null;
     const authHeader = request.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      recordFailedAuth(clientIp);
-      return new Response("Unauthorized", { status: 401 });
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.slice("Bearer ".length).trim();
+    } else if (url.searchParams.has("token")) {
+      token = url.searchParams.get("token");
     }
 
-    const token = authHeader.slice("Bearer ".length).trim();
-    if (!env.ROOM_TOKEN || token !== env.ROOM_TOKEN) {
+    if (!token || !env.ROOM_TOKEN || token !== env.ROOM_TOKEN) {
       recordFailedAuth(clientIp);
       return new Response("Unauthorized", { status: 401 });
     }
 
     // Berhasil autentikasi
     recordSuccessfulAuth(clientIp);
+
+    // If reset endpoint, route directly to DO
+    if (url.pathname === "/reset") {
+      const roomId = env.ROOM.idFromName("private-sleep-room");
+      const room = env.ROOM.get(roomId);
+      return room.fetch(request);
+    }
+
+    // Check WebSocket upgrade
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
 
     // Route to Durable Object — single room with fixed name
     const roomId = env.ROOM.idFromName("private-sleep-room");

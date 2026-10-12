@@ -925,7 +925,10 @@ export function useCall() {
               setStatus("error");
               showNotice("Room penuh (maksimal 2 peserta)");
             } else if (msg.code === "replaced") {
-              showNotice("Sesi digantikan oleh koneksi perangkat lain");
+              userLeftRef.current = true;
+              if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+              setStatus("disconnected");
+              showNotice("Sesi digantikan oleh perangkat/tab lain");
             }
             break;
           }

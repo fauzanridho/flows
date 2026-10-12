@@ -261,15 +261,11 @@ export class Room implements DurableObject {
 
     const sockets = this.state.getWebSockets();
 
-    // Check if same deviceId OR same platform already exists — replace it
+    // Check if same deviceId already exists — replace it
     for (const existing of sockets) {
       if (existing === ws) continue;
       const attachment = existing.deserializeAttachment() as WSAttachment | null;
-      if (
-        attachment &&
-        (attachment.deviceId === deviceId ||
-          (attachment.platform === platform && platform !== "unknown" && platform !== "test"))
-      ) {
+      if (attachment && attachment.deviceId === deviceId) {
         // Notify peer about the old connection leaving
         const otherPeer = this.getPeerExcluding(existing, ws);
         if (otherPeer) {

@@ -765,48 +765,7 @@ export function useCall() {
               const pPlat = typeof peerObj === "object" ? (peerObj as any)?.platform : undefined;
               setPartner((prev) => ({ ...prev, online: true, deviceId: pId, platform: pPlat }));
 
-              // Impolite peer initiates offer if partner is already present
-              if (msg.role === "impolite") {
-                setTimeout(async () => {
-                  if (pc && pc.signalingState === "stable") {
-                    try {
-                      makingOfferRef.current = true;
-                      const offer = await pc.createOffer();
-                      const modifiedSdp = enhanceOpusSDP(offer.sdp || "", modeRef.current);
-                      await pc.setLocalDescription(new RTCSessionDescription({ type: "offer", sdp: modifiedSdp }));
-                      if (wsRef.current?.readyState === WebSocket.OPEN) {
-                        wsRef.current.send(JSON.stringify({
-                          type: "signal",
-                          kind: "offer",
-                          data: pc.localDescription,
-                        }));
-                      }
-                    } catch (e) {
-                      console.warn("Failed initial offer:", e);
-                    } finally {
-                      makingOfferRef.current = false;
-                    }
-                  }
-                }, 150);
-              }
-            }
-            break;
-          }
-
-          case "peer-joined": {
-            console.log("[Signaling] Partner joined:", msg.deviceId);
-            setStatus("negotiating");
-            setPartner((prev) => ({
-              ...prev,
-              online: true,
-              deviceId: msg.deviceId,
-              platform: msg.platform,
-            }));
-            showNotice("Partner hadir! Tersambung otomatis.");
-
-            // If we are impolite, initiate offer to newly arrived partner
-            if (roleRef.current === "impolite") {
-              const pc = pcRef.current;
+              // Initiate offer if partner is already present
               setTimeout(async () => {
                 if (pc && pc.signalingState === "stable") {
                   try {
@@ -822,13 +781,50 @@ export function useCall() {
                       }));
                     }
                   } catch (e) {
-                    console.warn("Failed peer-joined offer:", e);
+                    console.warn("Failed initial offer:", e);
                   } finally {
                     makingOfferRef.current = false;
                   }
                 }
               }, 150);
             }
+            break;
+          }
+
+          case "peer-joined": {
+            console.log("[Signaling] Partner joined:", msg.deviceId);
+            setStatus("negotiating");
+            setPartner((prev) => ({
+              ...prev,
+              online: true,
+              deviceId: msg.deviceId,
+              platform: msg.platform,
+            }));
+            showNotice("Partner hadir! Tersambung otomatis.");
+
+            // Initiate offer to newly arrived partner
+            const pc = pcRef.current;
+            setTimeout(async () => {
+              if (pc && pc.signalingState === "stable") {
+                try {
+                  makingOfferRef.current = true;
+                  const offer = await pc.createOffer();
+                  const modifiedSdp = enhanceOpusSDP(offer.sdp || "", modeRef.current);
+                  await pc.setLocalDescription(new RTCSessionDescription({ type: "offer", sdp: modifiedSdp }));
+                  if (wsRef.current?.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(JSON.stringify({
+                      type: "signal",
+                      kind: "offer",
+                      data: pc.localDescription,
+                    }));
+                  }
+                } catch (e) {
+                  console.warn("Failed peer-joined offer:", e);
+                } finally {
+                  makingOfferRef.current = false;
+                }
+              }
+            }, 150);
             break;
           }
 

@@ -13,6 +13,7 @@ import {
   Maximize2,
   Minimize2,
   RotateCw,
+  PhoneCall,
 } from "lucide-react";
 import { PartnerState, ConnectionStatus } from "@/types/call";
 
@@ -23,6 +24,7 @@ interface VideoStageProps {
   status: ConnectionStatus;
   cameraOn: boolean;
   muted: boolean;
+  onConnect?: () => void;
 }
 
 export const VideoStage: React.FC<VideoStageProps> = ({
@@ -32,6 +34,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   status,
   cameraOn,
   muted,
+  onConnect,
 }) => {
   const showRemoteVideo = status === "connected" && partner.camera;
 
@@ -328,7 +331,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           </div>
 
           {/* Status Label & Micro-info */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center", maxWidth: 420 }}>
             <h3
               style={{
                 fontSize: 18,
@@ -341,18 +344,47 @@ export const VideoStage: React.FC<VideoStageProps> = ({
                 ? "Partner Tersambung"
                 : status === "waiting-partner"
                 ? "Menunggu Partner Bergabung"
-                : "Sleep Call Room"}
+                : status === "connecting-signaling"
+                ? "Menghubungkan ke Room..."
+                : "Siap Memulai Sleep Call"}
             </h3>
 
-            <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+            <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5 }}>
               {status === "connected"
                 ? partner.camera
                   ? "Kamera aktif"
                   : "Kamera partner mati (Audio tetap tersambung)"
                 : status === "waiting-partner"
                 ? "Buka aplikasi di Android atau perangkat partner"
-                : "Menghubungkan ke signaling server..."}
+                : status === "connecting-signaling"
+                ? "Melakukan otentikasi dan handshake P2P..."
+                : "Panggilan P2P privat dengan transmisi hemat daya & mode gelap OLED."}
             </p>
+
+            {status === "disconnected" && onConnect && (
+              <button
+                onClick={onConnect}
+                style={{
+                  marginTop: 8,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "12px 28px",
+                  borderRadius: "var(--radius-full)",
+                  background: "linear-gradient(135deg, #6366f1 0%, #3b82f6 100%)",
+                  border: "none",
+                  color: "#fff",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  boxShadow: "0 8px 24px rgba(99, 102, 241, 0.4)",
+                  transition: "all 0.15s ease",
+                }}
+              >
+                <PhoneCall size={16} />
+                <span>Masuk Room Panggilan</span>
+              </button>
+            )}
 
             {status === "connected" && !partner.muted && (
               <div

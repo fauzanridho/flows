@@ -44,12 +44,6 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
-  // Auto connect once on mount
-  useEffect(() => {
-    connectSignaling();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // Fullscreen shortcut listener (F)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -132,6 +126,7 @@ export default function Home() {
         status={status}
         cameraOn={cameraOn}
         muted={muted}
+        onConnect={connectSignaling}
       />
 
       {/* Floating Bottom Control Bar */}

@@ -116,6 +116,8 @@ export function useCall() {
   roleRef.current = role;
   const modeRef = useRef<CallMode>(mode);
   modeRef.current = mode;
+  const partnerRef = useRef<PartnerState>(partner);
+  partnerRef.current = partner;
 
   // Initialize config on mount
   useEffect(() => {
@@ -677,7 +679,12 @@ export function useCall() {
 
     // Negotiationneeded handler (Perfect negotiation)
     pc.onnegotiationneeded = () => {
-      doNegotiate();
+      // Only initiate negotiation if partner is currently in the room!
+      if (partnerRef.current.online) {
+        doNegotiate();
+      } else {
+        console.log("[WebRTC] onnegotiationneeded deferred — partner not in room yet");
+      }
     };
 
     return pc;
@@ -769,8 +776,10 @@ export function useCall() {
             const pc = createPeerConnection(msg.role);
 
             if (msg.peers.length === 0) {
+              partnerRef.current = { ...partnerRef.current, online: false };
               setStatus("waiting-partner");
             } else {
+              partnerRef.current = { ...partnerRef.current, online: true };
               setStatus("negotiating");
               const peerObj = msg.peers[0];
               const pId = typeof peerObj === "string" ? peerObj : (peerObj as any)?.deviceId;
@@ -805,6 +814,12 @@ export function useCall() {
 
           case "peer-joined": {
             console.log("[Signaling] Partner joined:", msg.deviceId);
+            partnerRef.current = {
+              ...partnerRef.current,
+              online: true,
+              deviceId: msg.deviceId,
+              platform: msg.platform,
+            };
             setStatus("negotiating");
             setPartner((prev) => ({
               ...prev,
@@ -817,7 +832,19 @@ export function useCall() {
             // Initiate offer to newly arrived partner
             const pc = pcRef.current;
             setTimeout(async () => {
-              if (pc && pc.signalingState === "stable") {
+              if (!pc) return;
+
+              // If pc was previously in have-local-offer, rollback to stable so fresh offer can be generated cleanly
+              if (pc.signalingState === "have-local-offer") {
+                console.log("[WebRTC] Rolling back stale local offer to negotiate fresh with partner");
+                try {
+                  await pc.setLocalDescription({ type: "rollback" } as any);
+                } catch (e) {
+                  console.warn("[WebRTC] Rollback error:", e);
+                }
+              }
+
+              if (pc.signalingState === "stable") {
                 try {
                   makingOfferRef.current = true;
                   const offer = await pc.createOffer();
@@ -842,6 +869,7 @@ export function useCall() {
 
           case "peer-left": {
             console.log("[Signaling] Partner left:", msg.deviceId);
+            partnerRef.current = { ...partnerRef.current, online: false };
             setPartner((prev) => ({ ...prev, online: false }));
             showNotice("Partner sedang offline");
             break;

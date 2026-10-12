@@ -261,11 +261,15 @@ export class Room implements DurableObject {
 
     const sockets = this.state.getWebSockets();
 
-    // Check if same deviceId already exists — replace it
+    // Check if same deviceId OR same platform already exists — replace it
     for (const existing of sockets) {
       if (existing === ws) continue;
       const attachment = existing.deserializeAttachment() as WSAttachment | null;
-      if (attachment && attachment.deviceId === deviceId) {
+      if (
+        attachment &&
+        (attachment.deviceId === deviceId ||
+          (attachment.platform === platform && platform !== "unknown" && platform !== "test"))
+      ) {
         // Notify peer about the old connection leaving
         const otherPeer = this.getPeerExcluding(existing, ws);
         if (otherPeer) {
@@ -289,8 +293,14 @@ export class Room implements DurableObject {
       return;
     }
 
-    // Determine role: first in room = impolite, second = polite
-    const role: "polite" | "impolite" = joinedPeers.length === 0 ? "impolite" : "polite";
+    // Determine role: guarantee exactly one "impolite" and one "polite" in the room
+    let role: "polite" | "impolite";
+    if (joinedPeers.length === 0) {
+      role = "impolite";
+    } else {
+      const otherRole = joinedPeers[0].attachment.role;
+      role = otherRole === "impolite" ? "polite" : "impolite";
+    }
 
     // Set attachment
     const attachment: WSAttachment = {

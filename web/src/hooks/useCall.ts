@@ -609,7 +609,23 @@ export function useCall() {
       }
     };
 
-    // Role-specific DataChannel creation
+    // Ensure standard Unified Plan m-line ordering (matches Android):
+    // mid 0: audio, mid 1: video, mid 2: application (data channel)
+    const localAudio = localStreamRef.current?.getAudioTracks()[0];
+    if (localAudio) {
+      pc.addTrack(localAudio, localStreamRef.current!);
+    } else {
+      try { pc.addTransceiver("audio", { direction: "sendrecv" }); } catch {}
+    }
+
+    const localVideo = localStreamRef.current?.getVideoTracks()[0];
+    if (localVideo) {
+      pc.addTrack(localVideo, localStreamRef.current!);
+    } else {
+      try { pc.addTransceiver("video", { direction: "sendrecv" }); } catch {}
+    }
+
+    // Role-specific DataChannel creation (mid 2)
     if (role === "impolite") {
       const dc = pc.createDataChannel("ctrl", { ordered: true });
       setupDataChannel(dc);
@@ -619,13 +635,6 @@ export function useCall() {
           setupDataChannel(event.channel);
         }
       };
-    }
-
-    // Add local tracks to PC
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
-      });
     }
 
     // Negotiation helper for impolite peer or negotiationneeded
@@ -700,7 +709,10 @@ export function useCall() {
         if (stream && pcRef.current) {
           stream.getTracks().forEach((track) => {
             const senders = pcRef.current?.getSenders() || [];
-            if (!senders.some((s) => s.track === track)) {
+            const existingSender = senders.find((s) => s.track?.kind === track.kind || (s as any).track === null);
+            if (existingSender) {
+              existingSender.replaceTrack(track).catch(() => {});
+            } else {
               pcRef.current?.addTrack(track, stream);
             }
           });

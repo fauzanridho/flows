@@ -1,7 +1,19 @@
 "use client";
 
-import React from "react";
-import { User, VideoOff, MicOff, Volume2, Sparkles, Moon } from "lucide-react";
+import React, { useState, useEffect, useRef } from "react";
+import {
+  User,
+  VideoOff,
+  MicOff,
+  Volume2,
+  Sparkles,
+  Moon,
+  Smartphone,
+  Monitor,
+  Maximize2,
+  Minimize2,
+  RotateCw,
+} from "lucide-react";
 import { PartnerState, ConnectionStatus } from "@/types/call";
 
 interface VideoStageProps {
@@ -23,6 +35,60 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 }) => {
   const showRemoteVideo = status === "connected" && partner.camera;
 
+  // Auto-rotation & aspect ratio states
+  const [orientation, setOrientation] = useState<"portrait" | "landscape" | "unknown">("unknown");
+  const [videoDim, setVideoDim] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  const [fitMode, setFitMode] = useState<"contain" | "cover">("contain");
+  const [userOverridden, setUserOverridden] = useState<boolean>(false);
+  const [showToast, setShowToast] = useState<string | null>(null);
+
+  // Detect partner video stream orientation (loadedmetadata & resize events)
+  useEffect(() => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+
+    const handleVideoDimensions = () => {
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (!w || !h) return;
+
+      const isPortrait = h > w;
+      const newOrientation = isPortrait ? "portrait" : "landscape";
+      setOrientation(newOrientation);
+      setVideoDim({ width: w, height: h });
+
+      // WA-style auto-behavior: If user hasn't explicitly locked a mode:
+      // Portrait video on desktop defaults to "contain" so the full frame (head to body) isn't cropped!
+      // Landscape video on desktop fills ("cover") naturally.
+      if (!userOverridden) {
+        setFitMode(isPortrait ? "contain" : "cover");
+      }
+    };
+
+    video.addEventListener("loadedmetadata", handleVideoDimensions);
+    video.addEventListener("resize", handleVideoDimensions);
+
+    if (video.videoWidth) {
+      handleVideoDimensions();
+    }
+
+    return () => {
+      video.removeEventListener("loadedmetadata", handleVideoDimensions);
+      video.removeEventListener("resize", handleVideoDimensions);
+    };
+  }, [remoteVideoRef, showRemoteVideo, userOverridden]);
+
+  // Toggle fit mode manually
+  const toggleFitMode = () => {
+    setUserOverridden(true);
+    setFitMode((prev) => {
+      const next = prev === "contain" ? "cover" : "contain";
+      setShowToast(next === "contain" ? "Mode: Sesuaikan Layar (Utuh)" : "Mode: Isi Layar (Penuh)");
+      setTimeout(() => setShowToast(null), 2500);
+      return next;
+    });
+  };
+
   return (
     <div
       style={{
@@ -35,19 +101,170 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         alignItems: "center",
         justifyContent: "center",
       }}
+      onDoubleClick={showRemoteVideo ? toggleFitMode : undefined}
     >
-      {/* Remote Video Stream */}
-      <video
-        ref={remoteVideoRef}
-        autoPlay
-        playsInline
+      {/* Ambient Aurora Glow Backdrop when partner video is in "contain" mode */}
+      {showRemoteVideo && fitMode === "contain" && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            overflow: "hidden",
+            pointerEvents: "none",
+            zIndex: 1,
+          }}
+        >
+          {/* Subtle blurred aura circles */}
+          <div
+            style={{
+              position: "absolute",
+              top: "20%",
+              left: "25%",
+              width: "50vw",
+              height: "50vw",
+              borderRadius: "50%",
+              background: "radial-gradient(circle, rgba(99, 102, 241, 0.16) 0%, rgba(139, 92, 246, 0.08) 45%, transparent 70%)",
+              filter: "blur(60px)",
+            }}
+          />
+          <div
+            style={{
+              position: "absolute",
+              bottom: "15%",
+              right: "25%",
+              width: "40vw",
+              height: "40vw",
+              borderRadius: "50%",
+              background: "radial-gradient(circle, rgba(16, 185, 129, 0.12) 0%, transparent 65%)",
+              filter: "blur(50px)",
+            }}
+          />
+        </div>
+      )}
+
+      {/* Remote Video Stream Container */}
+      <div
         style={{
+          position: "relative",
           width: "100%",
           height: "100%",
-          objectFit: "cover",
-          display: showRemoteVideo ? "block" : "none",
+          display: showRemoteVideo ? "flex" : "none",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 2,
         }}
-      />
+      >
+        <video
+          ref={remoteVideoRef}
+          autoPlay
+          playsInline
+          style={{
+            width: fitMode === "cover" ? "100%" : "auto",
+            height: fitMode === "cover" ? "100%" : "auto",
+            maxWidth: "100%",
+            maxHeight: "100%",
+            objectFit: fitMode,
+            borderRadius: fitMode === "contain" && orientation === "portrait" ? 20 : 0,
+            boxShadow:
+              fitMode === "contain" && orientation === "portrait"
+                ? "0 25px 60px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.08)"
+                : "none",
+            transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+          }}
+        />
+
+        {/* WhatsApp-Style Orientation & Fit Mode Overlay Controls (Top-Right) */}
+        {showRemoteVideo && (
+          <div
+            style={{
+              position: "absolute",
+              top: 76,
+              right: 28,
+              zIndex: 10,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: "rgba(18, 22, 34, 0.8)",
+              backdropFilter: "blur(16px)",
+              padding: "6px 12px",
+              borderRadius: "var(--radius-full)",
+              border: "1px solid rgba(255, 255, 255, 0.12)",
+              boxShadow: "0 8px 24px rgba(0, 0, 0, 0.5)",
+            }}
+          >
+            {/* Orientation Indicator */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: 11,
+                fontWeight: 500,
+                color: "var(--text-secondary)",
+                paddingRight: 8,
+                borderRight: "1px solid rgba(255, 255, 255, 0.15)",
+              }}
+            >
+              {orientation === "portrait" ? (
+                <>
+                  <Smartphone size={13} color="#a5b4fc" />
+                  <span>Potret (Auto)</span>
+                </>
+              ) : (
+                <>
+                  <Monitor size={13} color="#34d399" />
+                  <span>Lanskap (Auto)</span>
+                </>
+              )}
+            </div>
+
+            {/* Toggle Fit / Fill Button */}
+            <button
+              onClick={toggleFitMode}
+              title={fitMode === "contain" ? "Isi Layar (Zoom Penuh)" : "Sesuaikan Layar (Utuh)"}
+              style={{
+                background: "transparent",
+                border: "none",
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                cursor: "pointer",
+                color: "#fff",
+                fontSize: 11,
+                fontWeight: 600,
+                padding: "2px 4px",
+              }}
+            >
+              {fitMode === "contain" ? <Maximize2 size={13} /> : <Minimize2 size={13} />}
+              <span>{fitMode === "contain" ? "Sesuaikan" : "Penuh"}</span>
+            </button>
+          </div>
+        )}
+
+        {/* Notification Toast for Fit Mode Change */}
+        {showToast && (
+          <div
+            className="animate-fade-in"
+            style={{
+              position: "absolute",
+              bottom: 120,
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 20,
+              background: "rgba(10, 14, 24, 0.9)",
+              backdropFilter: "blur(12px)",
+              border: "1px solid rgba(255, 255, 255, 0.15)",
+              borderRadius: 20,
+              padding: "6px 16px",
+              fontSize: 12,
+              fontWeight: 500,
+              color: "#fff",
+            }}
+          >
+            {showToast}
+          </div>
+        )}
+      </div>
 
       {/* Remote Placeholder when camera is OFF or Partner is waiting */}
       {!showRemoteVideo && (
